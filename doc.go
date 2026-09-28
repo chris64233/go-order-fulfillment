@@ -1,2 +1,15 @@
-// Package goorderfulfillment provides the starting point for the task.
+// Package goorderfulfillment 实现订单跨仓拆分履约与缺货重配。
+//
+// 核心能力：
+//   - 订单确认时按各仓可用库存（ATP）生成跨仓拆分方案，每个订单行必须完整满足，
+//     任一行不足则整体拒绝、不留任何占用；
+//   - 单锁串行化所有写操作，并发确认不会超卖；相同外部订单号 + 相同内容幂等
+//     返回原方案，内容变化返回 ErrOrderConflict；
+//   - 仓库拣货回执支持累计补拣与显式短缺声明：已拣数量保留，缺口生成下一版
+//     跨仓方案；旧方案的迟到回执按 ErrStaleReceipt 拒绝，杜绝同一商品重复发出；
+//   - 取消只释放尚未拣货的库存；取消、缺货重配、发货在同一事务边界内保持
+//     订单状态、库存占用与发货记录一致；
+//   - 全部方案版本持久化到 JSON 原子快照，进程重启可无损恢复（含幂等去重集合）。
+//
+// 入口类型为 Service，使用 NewService 或 NewServiceFromFile 创建。
 package goorderfulfillment
