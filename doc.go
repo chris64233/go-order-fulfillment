@@ -1,2 +1,6 @@
-// Package goorderfulfillment provides the starting point for the task.
+// Package goorderfulfillment 实现订单跨仓拆分履约领域服务：
+// 库存登记、订单确认（跨仓拆分、整单原子、幂等/冲突检测）、拣货回执、
+// 部分缺货自动重配（每版方案持久化保留）、发货确认、取消与履约明细查询。
+// 实现为并发安全的内存服务，所有公开方法在同一把互斥锁内串行完成
+// “检查 + 写入”，因此并发确认不超卖，取消/重配/发货交错时账实一致。
 package goorderfulfillment

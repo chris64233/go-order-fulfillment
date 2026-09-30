@@ -828,6 +828,185 @@ func TestGetFulfillmentDetail_NotFound(t *testing.T) {
 	}
 }
 
+// ---------- 6. 补充边界用例 ----------
+
+func TestRegisterInventory_AccumulatesAndZeroSnapshot(t *testing.T) {
+	svc := newTestService(t)
+
+	// 累加语义：同一仓同一 SKU 重复登记，OnHand 与 Available 都累加。
+	mustRegister(t, svc, "W1", "A", 3)
+	snap, err := svc.RegisterInventory(RegisterInventoryRequest{WarehouseID: "W1", SKU: "A", Quantity: 4})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if snap.OnHand != 7 || snap.Available != 7 {
+		t.Errorf("accumulated snapshot = %+v, want onhand=7 available=7", snap)
+	}
+
+	// 从未登记的仓/SKU 返回零值快照，且回显查询键。
+	zero := svc.GetInventory("W9", "ZZ")
+	if zero.WarehouseID != "W9" || zero.SKU != "ZZ" ||
+		zero.OnHand != 0 || zero.Available != 0 || zero.Reserved != 0 ||
+		zero.Picked != 0 || zero.Shipped != 0 || zero.Lost != 0 {
+		t.Errorf("zero snapshot = %+v", zero)
+	}
+
+	// 非法入参：空仓库、空 SKU、非正数量。
+	for _, req := range []RegisterInventoryRequest{
+		{WarehouseID: "", SKU: "A", Quantity: 1},
+		{WarehouseID: "W1", SKU: "", Quantity: 1},
+		{WarehouseID: "W1", SKU: "A", Quantity: -2},
+	} {
+		if _, err := svc.RegisterInventory(req); !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("register %+v: want ErrInvalidArgument, got %v", req, err)
+		}
+	}
+}
+
+func TestShip_AlreadyShippedRejected(t *testing.T) {
+	svc := newTestService(t)
+	mustRegister(t, svc, "W1", "A", 5)
+	conf := mustConfirm(t, svc, "O1", []OrderLine{{SKU: "A", Quantity: 5}})
+	w1 := allocByWh(conf.Allocations, "W1")
+
+	if _, err := svc.ReceiptPick(w1.ID, 5); err != nil {
+		t.Fatalf("pick: %v", err)
+	}
+	if _, err := svc.Ship(ShipmentRequest{AllocationID: w1.ID, Quantity: 5}); err != nil {
+		t.Fatalf("ship: %v", err)
+	}
+	detail, err := svc.GetFulfillmentDetail("O1")
+	if err != nil || detail.Status != StatusShipped {
+		t.Fatalf("status = %s, err=%v", detail.Status, err)
+	}
+
+	// 终态订单上的任何发货尝试一律拒绝。
+	if _, err := svc.Ship(ShipmentRequest{AllocationID: w1.ID, Quantity: 1}); !errors.Is(err, ErrAlreadyShipped) {
+		t.Fatalf("ship after shipped: want ErrAlreadyShipped, got %v", err)
+	}
+	// 已发完订单的取消是无害空操作，状态保持 shipped、库存不变。
+	after, err := svc.Cancel(CancelRequest{OrderID: "O1"})
+	if err != nil {
+		t.Fatalf("cancel shipped order: %v", err)
+	}
+	if after.Status != StatusShipped {
+		t.Errorf("cancel flipped status to %s", after.Status)
+	}
+	// 已发完订单重复确认仍幂等返回原方案。
+	re, err := svc.ConfirmOrder(ConfirmOrderRequest{ExternalOrderID: "O1", Lines: []OrderLine{{SKU: "A", Quantity: 5}}})
+	if err != nil || !re.Reconfirmed || re.Status != StatusShipped {
+		t.Errorf("reconfirm shipped order: %+v err=%v", re, err)
+	}
+	assertInventoryInvariant(t, svc)
+}
+
+func TestCancel_PickedRemainderShipsToCompletion(t *testing.T) {
+	svc := newTestService(t)
+	mustRegister(t, svc, "W1", "A", 5)
+	conf := mustConfirm(t, svc, "O1", []OrderLine{{SKU: "A", Quantity: 5}})
+	w1 := allocByWh(conf.Allocations, "W1")
+
+	// 全部拣出后取消：无未拣库存可释放，已拣部分保留。
+	if _, err := svc.ReceiptPick(w1.ID, 5); err != nil {
+		t.Fatalf("pick: %v", err)
+	}
+	detail, err := svc.Cancel(CancelRequest{OrderID: "O1"})
+	if err != nil || detail.Status != StatusCancelled {
+		t.Fatalf("cancel: status=%v err=%v", detail.Status, err)
+	}
+	if inv := svc.GetInventory("W1", "A"); inv.Picked != 5 || inv.Available != 0 {
+		t.Fatalf("picked stock must survive cancel: %+v", inv)
+	}
+
+	// 取消后把已拣部分发完，订单归一为 shipped（终态）。
+	if _, err := svc.Ship(ShipmentRequest{AllocationID: w1.ID, Quantity: 5}); err != nil {
+		t.Fatalf("ship after cancel: %v", err)
+	}
+	detail, err = svc.GetFulfillmentDetail("O1")
+	if err != nil || detail.Status != StatusShipped {
+		t.Fatalf("want shipped after shipping picked remainder, got %v (%v)", detail.Status, err)
+	}
+	assertInventoryInvariant(t, svc)
+}
+
+func TestReallocate_MultipleVersionsPersisted(t *testing.T) {
+	svc := newTestService(t)
+	mustRegister(t, svc, "W1", "A", 4)
+	conf := mustConfirm(t, svc, "O1", []OrderLine{{SKU: "A", Quantity: 4}})
+	w1 := allocByWh(conf.Allocations, "W1")
+
+	// v1 全短缺，无库存可重配 -> 自动重配失败，缺口悬空。
+	res, err := svc.PickingReceipt(PickingReceiptRequest{Items: []PickingReceiptItem{
+		{AllocationID: w1.ID, ShortageQty: 4},
+	}})
+	if err != nil || !errors.Is(res.ReallocateError, ErrInsufficientInventory) {
+		t.Fatalf("receipt: err=%v reerr=%v", err, res.ReallocateError)
+	}
+	// 补货 W2 -> 手动重配出 v2；W2 又全短缺 -> 自动重配再次失败。
+	mustRegister(t, svc, "W2", "A", 4)
+	re2, err := svc.Reallocate(ReallocateRequest{OrderID: "O1"})
+	if err != nil || re2.Version != 2 {
+		t.Fatalf("reallocate v2: ver=%d err=%v", re2.Version, err)
+	}
+	res, err = svc.PickingReceipt(PickingReceiptRequest{Items: []PickingReceiptItem{
+		{AllocationID: re2.Allocations[0].ID, ShortageQty: 4},
+	}})
+	if err != nil || !errors.Is(res.ReallocateError, ErrInsufficientInventory) {
+		t.Fatalf("receipt v2: err=%v reerr=%v", err, res.ReallocateError)
+	}
+	// 补货 W3 -> 手动重配出 v3，拣齐并发货。
+	mustRegister(t, svc, "W3", "A", 4)
+	re3, err := svc.Reallocate(ReallocateRequest{OrderID: "O1"})
+	if err != nil || re3.Version != 3 {
+		t.Fatalf("reallocate v3: ver=%d err=%v", re3.Version, err)
+	}
+	w3 := re3.Allocations[0]
+	if w3.WarehouseID != "W3" {
+		t.Fatalf("v3 should use W3, got %+v", w3)
+	}
+	if _, err := svc.ReceiptPick(w3.ID, 4); err != nil {
+		t.Fatalf("pick v3: %v", err)
+	}
+	if _, err := svc.Ship(ShipmentRequest{AllocationID: w3.ID, Quantity: 4}); err != nil {
+		t.Fatalf("ship v3: %v", err)
+	}
+
+	// 三版方案全部持久化保留，各自状态与备注正确。
+	detail, err := svc.GetFulfillmentDetail("O1")
+	if err != nil {
+		t.Fatalf("detail: %v", err)
+	}
+	if len(detail.Versions) != 3 {
+		t.Fatalf("persisted versions = %d, want 3", len(detail.Versions))
+	}
+	for i, want := range []struct {
+		version int
+		note    string
+		status  AllocationStatus
+	}{
+		{1, "confirm", AllocShortageClosed},
+		{2, "manual reallocate", AllocShortageClosed},
+		{3, "manual reallocate", AllocPickedComplete},
+	} {
+		v := detail.Versions[i]
+		if v.Version != want.version || v.Note != want.note {
+			t.Errorf("version[%d] = v%d %q, want v%d %q", i, v.Version, v.Note, want.version, want.note)
+		}
+		if got := v.Allocations[0].Status; got != want.status {
+			t.Errorf("v%d alloc status = %s, want %s", v.Version, got, want.status)
+		}
+	}
+	if detail.Status != StatusShipped {
+		t.Errorf("status = %s, want shipped", detail.Status)
+	}
+	sum := detail.LineSummary[0]
+	if sum.Shipped != 4 || sum.Lost != 8 || sum.Outstanding != 0 {
+		t.Errorf("line summary = %+v", sum)
+	}
+	assertNoDoubleShip(t, detail)
+	assertInventoryInvariant(t, svc)
+}
+
 // ---------- 辅助 ----------
 
 func sumQty(allocs []*Allocation) int {
