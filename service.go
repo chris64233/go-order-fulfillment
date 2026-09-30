@@ -231,6 +231,12 @@ func (s *FulfillmentService) PickingReceipt(req PickingReceiptRequest) (*Picking
 	sort.Strings(orderIDs)
 	for _, id := range orderIDs {
 		ver, allocs, err := s.reallocateLocked(s.orders[id], "reallocate after shortage")
+		result.Reallocations = append(result.Reallocations, OrderReallocation{
+			OrderID:     id,
+			Version:     ver,
+			Allocations: allocs,
+			Err:         err,
+		})
 		if result.ReallocatedVersion == 0 {
 			result.ReallocatedVersion = ver
 			result.Reallocated = allocs

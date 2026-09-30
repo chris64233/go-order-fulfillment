@@ -70,6 +70,22 @@ type PickingReceiptResult struct {
 	Reallocated []*Allocation
 	// ReallocateError 重配失败原因（如 ErrInsufficientInventory）；失败不影响已成功拣出数量的落账。
 	ReallocateError error
+	// Reallocations 本次回执涉及的每一个订单的重配结果，按订单号排序。
+	// 一批回执可能跨多个订单：单值字段（ReallocatedVersion/Reallocated/
+	// ReallocateError）只回传其中第一个订单的结果，其余订单统一看这里，
+	// 避免“一个订单重配成功、另一个订单仍缺货”时失败信息被覆盖。
+	Reallocations []OrderReallocation
+}
+
+// OrderReallocation 单个订单在某次拣货回执后的缺货重配结果。
+type OrderReallocation struct {
+	OrderID string
+	// Version 新生成的方案版本号；重配失败（仍缺货）时为 0。
+	Version int
+	// Allocations 新版本中的分配；失败时为空，补货后可用 Reallocate 重试。
+	Allocations []*Allocation
+	// Err 重配失败原因（如 ErrInsufficientInventory）；成功时为 nil。
+	Err error
 }
 
 // ---------- 缺货重配 ----------
