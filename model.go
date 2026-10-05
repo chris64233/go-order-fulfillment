@@ -75,6 +75,9 @@ type Allocation struct {
 	PickedQty int
 	// ShippedQty 累计已由该仓库发出的数量。
 	ShippedQty int
+	// PackedQty 已拣出且已装入待出库包裹、尚未随包裹出库的数量。
+	// 该部分不能再通过 Ship 直接发货，只能由包裹出库扣减。
+	PackedQty int
 	// ShortageQty 仓库报告的短缺（永久缺口）数量。
 	ShortageQty int
 	Status      AllocationStatus
@@ -127,3 +130,66 @@ type Order struct {
 func orderVersions(o *Order) []*PlanVersion { return o.versions }
 
 func (o *Order) setVersions(v []*PlanVersion) { o.versions = v }
+
+// PackageStatus 包裹状态。
+type PackageStatus string
+
+const (
+	// PackagePending 已装箱、尚未出库，可参与合并。
+	PackagePending PackageStatus = "pending"
+	// PackageShipped 已出库，不可再被合并。
+	PackageShipped PackageStatus = "shipped"
+	// PackageInTransit 承运中，不可再被合并。
+	PackageInTransit PackageStatus = "in_transit"
+	// PackageMerged 已被合并进新包裹。记录永久保留用于审计，不可删除、不可恢复。
+	PackageMerged PackageStatus = "merged"
+)
+
+// mergeable 包裹是否可参与合并：仅“尚未出库”的包裹可以。
+func (s PackageStatus) mergeable() bool { return s == PackagePending }
+
+// packageItem 包裹内按来源分配记录的商品明细（内部结构），
+// 包裹出库时据此精确扣减对应分配与仓库库存。
+type packageItem struct {
+	AllocationID string
+	SKU          string
+	Quantity     int
+}
+
+// Package 包裹：一张订单下、同一目的地、同一承运约束的一组已拣商品。
+type Package struct {
+	// ID 形如 <orderExternalID>#pkg-<seq>，全局唯一、按创建顺序递增。
+	ID          string
+	OrderID     string
+	Destination string
+	// Carrier 承运约束（承运商/运输方式），合并时各包裹必须一致。
+	Carrier string
+	// items 按来源分配记录的内部明细，合并时整体转移给新包裹。
+	items []packageItem
+	// Items 聚合后的商品明细（按 SKU 升序）。
+	Items  []OrderLine
+	Status PackageStatus
+	// MergedInto 仅当 Status 为 merged 时有效：指向合并产生的新包裹 ID。
+	MergedInto string
+	// MergeID 产生本包裹（新包裹）或消费本包裹（旧包裹）的合并号。
+	MergeID   string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// MergeRecord 一次包裹合并的审计记录，按合并号持久化，用于幂等重放与历史查询。
+type MergeRecord struct {
+	MergeID string
+	OrderID string
+	// SourcePackageIDs 被合并的原包裹 ID，升序保存。
+	SourcePackageIDs []string
+	NewPackageID     string
+	Destination      string
+	Carrier          string
+	Items            []OrderLine
+	// fingerprint 合并申请内容（订单、包裹集合、目的地、承运约束、商品明细）的规范化指纹。
+	fingerprint string
+	// seq 合并记录的全局创建序号，保证查询排序稳定。
+	seq       int
+	CreatedAt time.Time
+}

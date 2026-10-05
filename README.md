@@ -3,7 +3,7 @@
 订单跨仓拆分履约领域服务（Go，零依赖、并发安全、内存持久化每版方案）。
 
 支持：库存登记、订单确认（跨仓拆分 + 幂等/冲突检测）、仓库拣货回执、部分缺货自动重配、
-发货确认、取消、履约明细查询。
+发货确认、取消、包裹装箱与合并、包裹出库/承运回执、履约明细查询。
 
 ## 快速开始
 
@@ -36,6 +36,25 @@ detail, _ := svc.GetFulfillmentDetail("ORDER-1")
 
 // 6. 取消（仅释放尚未拣货的预留）
 svc.Cancel(goorderfulfillment.CancelRequest{OrderID: "ORDER-1"})
+
+// 7. 装箱：把已拣商品装成待出库包裹（同一目的地 + 同一承运约束）
+pkg1, _ := svc.PackItems(goorderfulfillment.PackItemsRequest{
+    OrderID: "ORDER-1", Destination: "DEST-1", Carrier: "CARRIER-A",
+    Items: []goorderfulfillment.PackItem{{AllocationID: conf.Allocations[0].ID, Quantity: 7}},
+})
+
+// 8. 包裹合并：多个尚未出库、目的地相同的包裹合并为一个新包裹
+merge, _ := svc.MergePackages(goorderfulfillment.MergePackagesRequest{
+    MergeID: "MERGE-1", OrderID: "ORDER-1",
+    PackageIDs: []string{pkg1.ID, pkg2.ID},
+    Destination: "DEST-1", Carrier: "CARRIER-A",
+    Items: []goorderfulfillment.OrderLine{{SKU: "A", Quantity: 10}},
+})
+// merge.NewPackage 是唯一的新包裹；原包裹保留并标记为 merged
+
+// 9. 包裹出库 / 承运揽收回执
+svc.PackageOutbound(goorderfulfillment.PackageOutboundRequest{PackageID: merge.NewPackage.ID})
+svc.PackageTransit(goorderfulfillment.PackageTransitRequest{PackageID: merge.NewPackage.ID})
 ```
 
 ## API
@@ -51,6 +70,10 @@ svc.Cancel(goorderfulfillment.CancelRequest{OrderID: "ORDER-1"})
 | `Ship` | 仓库发货确认 |
 | `Cancel` | 取消订单，只释放未拣货库存 |
 | `GetFulfillmentDetail` | 订单状态、逐行汇总、全部版本方案、全部发货记录 |
+| `PackItems` | 把已拣未发的商品装成待出库包裹（固定目的地与承运约束） |
+| `MergePackages` | 包裹合并申请：多个未出库、同目的地包裹合并为一个新包裹 |
+| `PackageOutbound` | 包裹出库回执（pending → shipped），库存 Picked → Shipped |
+| `PackageTransit` | 承运揽收回执（shipped → in_transit） |
 
 ## 核心规则
 
@@ -88,11 +111,33 @@ svc.Cancel(goorderfulfillment.CancelRequest{OrderID: "ORDER-1"})
 - 取消后不允许重配；针对已释放分配的迟到拣货回执会被拒绝，库存不会被重新占用。
 - 取消、缺货重配、发货确认由同一把锁互斥，订单状态、库存占用、发货记录在任何交错下都作为整体一致。
 
+### 6. 包裹装箱与合并
+
+- **装箱**：`PackItems` 从分配的“已拣、未发、未装箱”数量中取材，生成 `pending` 包裹；
+  已装箱数量计入分配的 `PackedQty`，不能再通过 `Ship` 直接发货，杜绝重复发货。
+- **合并申请固定四要素**：订单、包裹集合、商品明细、承运约束。集合中存在任何不可合并包裹
+  （不存在、不属于本订单、已出库、承运中、已合并、目的地不同、承运约束不符）时**整单拒绝**，
+  不产生任何状态变化；声明的商品明细必须与原包裹合计完全一致（`ErrMergeItemMismatch`）。
+- **合并确认只产生一个新包裹**：原包裹记录永久保留并标记为 `merged`（`MergedInto` 指向新包裹），
+  历史不删除；商品明细按来源分配整体转移给新包裹。
+- **幂等与冲突**：同一合并号 + 相同内容重放返回原结果（`Replayed=true`）；
+  包裹集合、目的地或商品明细变化返回 `ErrMergeConflict`；
+  仅承运约束变化返回 `ErrMergeCarrierConflict`，明确阻断原因。
+- **旧包裹回执防护**：已合并/已出库/承运中的包裹收到出库或揽收回执一律返回
+  `ErrStalePackage`，不能恢复已合并记录，也不会重复扣减库存。
+- **并发一致性**：拣货、装箱、合并、取消、出库在同一把锁内串行，
+  库存扣减（`Picked → Shipped`）与包裹状态迁移作为整体一致；
+  不变量：全部待出库包裹商品总量 == 全部分配 `PackedQty` 合计。
+- **查询**：`GetFulfillmentDetail` 返回全部包裹（含已合并历史，按包裹 ID 升序）与
+  合并审计记录（按合并发生顺序），排序稳定、深拷贝返回。
+
 ## 状态模型
 
 - 订单：`pending`（方案已建）→ `in_fulfillment`（部分拣货/发货/悬空缺口）→ `shipped`（全部需求已发）；
   随时可 → `cancelled`（部分取消时已拣部分仍允许发完，发完后归一为 `shipped`）。
 - 分配：`active` → `picked_complete` / `shortage_closed` / `cancelled`，关闭后不可再回执。
+- 包裹：`pending`（待出库，可合并）→ `shipped`（已出库）→ `in_transit`（承运中）；
+  `pending` → `merged`（被合并，终态，记录保留）。仅 `pending` 可参与合并。
 
 ## 测试
 
@@ -103,7 +148,9 @@ go test -race -count=1 ./...
 覆盖：跨仓拆分、整单原子拒绝、幂等/冲突、30 并发抢 10 件库存的防超卖、
 部分短缺自动重配、迟到/重复回执拒绝、批原子性、补货后手动重配、发货防重、
 取消只释放未拣货、40 订单并发交错（取消/重配/发货/查询）后的全局账实审计、
-库存恒等式与防重复发货校验。
+库存恒等式与防重复发货校验；包裹合并的整单拒绝（部分不可合并）、幂等重放与
+集合/目的地/承运约束冲突、旧包裹重复回执防护、装箱超量与装箱后直发拦截、
+拣货/合并/取消并发竞争一致性、包裹与合并审计的历史查询稳定性。
 
 ## 持久化说明
 
