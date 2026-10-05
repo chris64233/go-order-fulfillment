@@ -82,6 +82,53 @@ func allocByWh(allocs []*Allocation, wh string) *Allocation {
 	return nil
 }
 
+// assertPackageConsistency 校验包裹与分配之间的一致性：
+// 所有待出库包裹的商品总量 == 全部分配的 PackedQty 合计，
+// 且已合并包裹永远保持 merged（旧回执不能恢复）。
+func assertPackageConsistency(t *testing.T, svc *FulfillmentService) {
+	t.Helper()
+	pendingBySKU := map[string]int{}
+	for _, p := range svc.packages {
+		if p.Status != PackagePending {
+			continue
+		}
+		for _, item := range p.Items {
+			pendingBySKU[item.SKU] += item.Quantity
+		}
+	}
+	packedBySKU := map[string]int{}
+	for _, a := range svc.allocations {
+		if a.PackedQty < 0 {
+			t.Errorf("allocation %s negative packed qty %d", a.ID, a.PackedQty)
+		}
+		packedBySKU[a.LineSKU] += a.PackedQty
+	}
+	for sku, q := range packedBySKU {
+		if pendingBySKU[sku] != q {
+			t.Errorf("sku %s packed qty %d != pending packages total %d", sku, q, pendingBySKU[sku])
+		}
+	}
+	for sku, q := range pendingBySKU {
+		if packedBySKU[sku] != q {
+			t.Errorf("sku %s pending packages total %d != packed qty %d", sku, q, packedBySKU[sku])
+		}
+	}
+}
+
+func mustPack(t *testing.T, svc *FulfillmentService, orderID string, items []PackItem) *PackageView {
+	t.Helper()
+	pkg, err := svc.PackItems(PackItemsRequest{
+		OrderID:     orderID,
+		Destination: "DEST-1",
+		Carrier:     "CARRIER-A",
+		Items:       items,
+	})
+	if err != nil {
+		t.Fatalf("pack items for %s: %v", orderID, err)
+	}
+	return pkg
+}
+
 // ---------- 1. 跨仓拆分与原子性 ----------
 
 func TestConfirmOrder_SplitAcrossWarehouses(t *testing.T) {
@@ -836,4 +883,506 @@ func sumQty(allocs []*Allocation) int {
 		n += a.Quantity
 	}
 	return n
+}
+
+// ---------- 包裹合并 ----------
+
+// setupMergeableOrder 构造一张两仓订单并全部拣齐，返回两条分配。
+func setupMergeableOrder(t *testing.T, svc *FulfillmentService, orderID string) (alloc1, alloc2 *Allocation) {
+	t.Helper()
+	mustRegister(t, svc, "W1", "A", 5)
+	mustRegister(t, svc, "W2", "A", 5)
+	conf := mustConfirm(t, svc, orderID, []OrderLine{{SKU: "A", Quantity: 10}})
+	alloc1 = allocByWh(conf.Allocations, "W1")
+	alloc2 = allocByWh(conf.Allocations, "W2")
+	if alloc1 == nil || alloc2 == nil {
+		t.Fatalf("expected allocations in W1 and W2, got %+v", conf.Allocations)
+	}
+	if _, err := svc.ReceiptPick(alloc1.ID, alloc1.Quantity); err != nil {
+		t.Fatalf("pick %s: %v", alloc1.ID, err)
+	}
+	if _, err := svc.ReceiptPick(alloc2.ID, alloc2.Quantity); err != nil {
+		t.Fatalf("pick %s: %v", alloc2.ID, err)
+	}
+	return alloc1, alloc2
+}
+
+func TestMergePackages_HappyPath(t *testing.T) {
+	svc := newTestService(t)
+	alloc1, alloc2 := setupMergeableOrder(t, svc, "OM1")
+
+	pkg1 := mustPack(t, svc, "OM1", []PackItem{{AllocationID: alloc1.ID, Quantity: 5}})
+	pkg2 := mustPack(t, svc, "OM1", []PackItem{{AllocationID: alloc2.ID, Quantity: 5}})
+
+	res, err := svc.MergePackages(MergePackagesRequest{
+		MergeID:     "M1",
+		OrderID:     "OM1",
+		PackageIDs:  []string{pkg2.ID, pkg1.ID}, // 乱序传入，结果应确定
+		Destination: "DEST-1",
+		Carrier:     "CARRIER-A",
+		Items:       []OrderLine{{SKU: "A", Quantity: 10}},
+	})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if res.Replayed {
+		t.Fatalf("first merge must not be a replay")
+	}
+	// 只产生一个新包裹。
+	if res.NewPackage.ID == "" || res.NewPackage.ID == pkg1.ID || res.NewPackage.ID == pkg2.ID {
+		t.Fatalf("unexpected new package %+v", res.NewPackage)
+	}
+	if res.NewPackage.Status != PackagePending {
+		t.Errorf("new package status = %s, want pending", res.NewPackage.Status)
+	}
+	if len(res.NewPackage.Items) != 1 || res.NewPackage.Items[0].SKU != "A" || res.NewPackage.Items[0].Quantity != 10 {
+		t.Errorf("new package items = %+v, want A:10", res.NewPackage.Items)
+	}
+	// 原包裹保留并标记为已合并，指向新包裹。
+	if len(res.MergedPackages) != 2 {
+		t.Fatalf("merged packages = %d, want 2", len(res.MergedPackages))
+	}
+	for _, mp := range res.MergedPackages {
+		if mp.Status != PackageMerged {
+			t.Errorf("source package %s status = %s, want merged", mp.ID, mp.Status)
+		}
+		if mp.MergedInto != res.NewPackage.ID {
+			t.Errorf("source package %s MergedInto = %s, want %s", mp.ID, mp.MergedInto, res.NewPackage.ID)
+		}
+	}
+	// 原包裹记录仍保留在服务内，未被删除。
+	if svc.packages[pkg1.ID] == nil || svc.packages[pkg2.ID] == nil {
+		t.Fatalf("merged source packages must be retained")
+	}
+	// 库存不变：合并不移动库存，商品仍在 Picked 桶。
+	if inv := svc.GetInventory("W1", "A"); inv.Picked != 5 || inv.Shipped != 0 {
+		t.Errorf("W1 inventory after merge = %+v, want picked=5 shipped=0", inv)
+	}
+	assertInventoryInvariant(t, svc)
+	assertPackageConsistency(t, svc)
+}
+
+func TestMergePackages_RejectWhenAnyNotMergeable(t *testing.T) {
+	svc := newTestService(t)
+	alloc1, alloc2 := setupMergeableOrder(t, svc, "OM2")
+
+	pkg1 := mustPack(t, svc, "OM2", []PackItem{{AllocationID: alloc1.ID, Quantity: 3}})
+	pkg2 := mustPack(t, svc, "OM2", []PackItem{{AllocationID: alloc1.ID, Quantity: 2}})
+	pkg3 := mustPack(t, svc, "OM2", []PackItem{{AllocationID: alloc2.ID, Quantity: 5}})
+	// pkg3 已出库：不可再被合并。
+	if _, err := svc.PackageOutbound(PackageOutboundRequest{PackageID: pkg3.ID}); err != nil {
+		t.Fatalf("outbound pkg3: %v", err)
+	}
+
+	pkgCountBefore := len(svc.packages)
+	_, err := svc.MergePackages(MergePackagesRequest{
+		MergeID:     "M2",
+		OrderID:     "OM2",
+		PackageIDs:  []string{pkg1.ID, pkg2.ID, pkg3.ID},
+		Destination: "DEST-1",
+		Carrier:     "CARRIER-A",
+		Items:       []OrderLine{{SKU: "A", Quantity: 10}},
+	})
+	if !errors.Is(err, ErrPackageNotMergeable) {
+		t.Fatalf("want ErrPackageNotMergeable, got %v", err)
+	}
+	// 整单拒绝：不产生新包裹、不写合并记录，其余包裹保持 pending。
+	if len(svc.packages) != pkgCountBefore {
+		t.Errorf("package count changed after rejected merge: %d -> %d", pkgCountBefore, len(svc.packages))
+	}
+	if len(svc.merges) != 0 {
+		t.Errorf("merge record created after rejected merge")
+	}
+	for _, id := range []string{pkg1.ID, pkg2.ID} {
+		if svc.packages[id].Status != PackagePending {
+			t.Errorf("package %s status = %s, want pending after rejected merge", id, svc.packages[id].Status)
+		}
+	}
+
+	// 目的地不同同样整单拒绝。
+	_, err = svc.MergePackages(MergePackagesRequest{
+		MergeID:     "M2b",
+		OrderID:     "OM2",
+		PackageIDs:  []string{pkg1.ID, pkg2.ID},
+		Destination: "DEST-OTHER",
+		Carrier:     "CARRIER-A",
+		Items:       []OrderLine{{SKU: "A", Quantity: 5}},
+	})
+	if !errors.Is(err, ErrPackageNotMergeable) {
+		t.Fatalf("destination mismatch: want ErrPackageNotMergeable, got %v", err)
+	}
+	assertInventoryInvariant(t, svc)
+	assertPackageConsistency(t, svc)
+}
+
+func TestMergePackages_IdempotentReplayAndConflicts(t *testing.T) {
+	svc := newTestService(t)
+	alloc1, alloc2 := setupMergeableOrder(t, svc, "OM3")
+	pkg1 := mustPack(t, svc, "OM3", []PackItem{{AllocationID: alloc1.ID, Quantity: 5}})
+	pkg2 := mustPack(t, svc, "OM3", []PackItem{{AllocationID: alloc2.ID, Quantity: 5}})
+
+	base := MergePackagesRequest{
+		MergeID:     "M3",
+		OrderID:     "OM3",
+		PackageIDs:  []string{pkg1.ID, pkg2.ID},
+		Destination: "DEST-1",
+		Carrier:     "CARRIER-A",
+		Items:       []OrderLine{{SKU: "A", Quantity: 10}},
+	}
+	first, err := svc.MergePackages(base)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	// 相同合并号 + 相同内容重放：返回原结果，不产生新包裹。
+	pkgCount := len(svc.packages)
+	replay, err := svc.MergePackages(base)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if !replay.Replayed {
+		t.Errorf("replay must be marked as replayed")
+	}
+	if replay.NewPackage.ID != first.NewPackage.ID {
+		t.Errorf("replay new package = %s, want original %s", replay.NewPackage.ID, first.NewPackage.ID)
+	}
+	if len(svc.packages) != pkgCount || len(svc.merges) != 1 {
+		t.Errorf("replay created new state: packages=%d merges=%d", len(svc.packages), len(svc.merges))
+	}
+
+	// 包裹集合非法：单包裹、集合内重复。
+	conflict := base
+	conflict.PackageIDs = []string{pkg1.ID}
+	if _, err := svc.MergePackages(conflict); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("single package: want ErrInvalidArgument, got %v", err)
+	}
+	conflict = base
+	conflict.PackageIDs = []string{pkg1.ID, pkg2.ID, pkg1.ID}
+	if _, err := svc.MergePackages(conflict); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("duplicate package: want ErrInvalidArgument, got %v", err)
+	}
+
+	// 目的地变化：冲突。
+	conflict = base
+	conflict.Destination = "DEST-2"
+	if _, err := svc.MergePackages(conflict); !errors.Is(err, ErrMergeConflict) {
+		t.Fatalf("destination change: want ErrMergeConflict, got %v", err)
+	}
+
+	// 商品明细变化：冲突。
+	conflict = base
+	conflict.Items = []OrderLine{{SKU: "A", Quantity: 9}}
+	if _, err := svc.MergePackages(conflict); !errors.Is(err, ErrMergeConflict) {
+		t.Fatalf("items change: want ErrMergeConflict, got %v", err)
+	}
+
+	// 仅承运约束变化：明确的阻断原因。
+	conflict = base
+	conflict.Carrier = "CARRIER-B"
+	if _, err := svc.MergePackages(conflict); !errors.Is(err, ErrMergeCarrierConflict) {
+		t.Fatalf("carrier change: want ErrMergeCarrierConflict, got %v", err)
+	}
+	assertInventoryInvariant(t, svc)
+	assertPackageConsistency(t, svc)
+}
+
+func TestMergePackages_ItemMismatchAndCarrierRestriction(t *testing.T) {
+	svc := newTestService(t)
+	alloc1, alloc2 := setupMergeableOrder(t, svc, "OM4")
+	pkg1 := mustPack(t, svc, "OM4", []PackItem{{AllocationID: alloc1.ID, Quantity: 3}})
+	pkg2 := mustPack(t, svc, "OM4", []PackItem{{AllocationID: alloc2.ID, Quantity: 5}})
+
+	// 声明明细与原包裹合计不符。
+	_, err := svc.MergePackages(MergePackagesRequest{
+		MergeID:     "M4",
+		OrderID:     "OM4",
+		PackageIDs:  []string{pkg1.ID, pkg2.ID},
+		Destination: "DEST-1",
+		Carrier:     "CARRIER-A",
+		Items:       []OrderLine{{SKU: "A", Quantity: 10}},
+	})
+	if !errors.Is(err, ErrMergeItemMismatch) {
+		t.Fatalf("want ErrMergeItemMismatch, got %v", err)
+	}
+
+	// 集合内包裹承运约束与申请不一致：明确阻断原因。
+	pkg3, err := svc.PackItems(PackItemsRequest{
+		OrderID: "OM4", Destination: "DEST-1", Carrier: "CARRIER-B",
+		Items: []PackItem{{AllocationID: alloc1.ID, Quantity: 2}},
+	})
+	if err != nil {
+		t.Fatalf("pack pkg3: %v", err)
+	}
+	_, err = svc.MergePackages(MergePackagesRequest{
+		MergeID:     "M4b",
+		OrderID:     "OM4",
+		PackageIDs:  []string{pkg1.ID, pkg3.ID},
+		Destination: "DEST-1",
+		Carrier:     "CARRIER-A",
+		Items:       []OrderLine{{SKU: "A", Quantity: 5}},
+	})
+	if !errors.Is(err, ErrCarrierRestriction) {
+		t.Fatalf("want ErrCarrierRestriction, got %v", err)
+	}
+	assertInventoryInvariant(t, svc)
+	assertPackageConsistency(t, svc)
+}
+
+func TestPackageOutbound_StaleReceiptCannotRestoreMerged(t *testing.T) {
+	svc := newTestService(t)
+	alloc1, alloc2 := setupMergeableOrder(t, svc, "OM5")
+	pkg1 := mustPack(t, svc, "OM5", []PackItem{{AllocationID: alloc1.ID, Quantity: 5}})
+	pkg2 := mustPack(t, svc, "OM5", []PackItem{{AllocationID: alloc2.ID, Quantity: 5}})
+
+	res, err := svc.MergePackages(MergePackagesRequest{
+		MergeID: "M5", OrderID: "OM5",
+		PackageIDs:  []string{pkg1.ID, pkg2.ID},
+		Destination: "DEST-1", Carrier: "CARRIER-A",
+		Items: []OrderLine{{SKU: "A", Quantity: 10}},
+	})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	// 旧包裹的迟到出库回执：拒绝，且不能恢复已合并记录。
+	if _, err := svc.PackageOutbound(PackageOutboundRequest{PackageID: pkg1.ID}); !errors.Is(err, ErrStalePackage) {
+		t.Fatalf("outbound merged pkg1: want ErrStalePackage, got %v", err)
+	}
+	if svc.packages[pkg1.ID].Status != PackageMerged {
+		t.Fatalf("pkg1 status = %s, stale receipt restored merged package", svc.packages[pkg1.ID].Status)
+	}
+	if svc.packages[pkg2.ID].Status != PackageMerged {
+		t.Fatalf("pkg2 status = %s, want merged", svc.packages[pkg2.ID].Status)
+	}
+	// 迟到回执没有扣减任何库存。
+	if inv := svc.GetInventory("W1", "A"); inv.Picked != 5 || inv.Shipped != 0 {
+		t.Fatalf("W1 inventory after stale receipt = %+v, want picked=5 shipped=0", inv)
+	}
+
+	// 新包裹正常出库：库存 Picked → Shipped，生成发货记录。
+	out, err := svc.PackageOutbound(PackageOutboundRequest{PackageID: res.NewPackage.ID})
+	if err != nil {
+		t.Fatalf("outbound new package: %v", err)
+	}
+	if out.Status != PackageShipped {
+		t.Errorf("new package status = %s, want shipped", out.Status)
+	}
+	if inv := svc.GetInventory("W1", "A"); inv.Picked != 0 || inv.Shipped != 5 {
+		t.Errorf("W1 inventory after outbound = %+v, want picked=0 shipped=5", inv)
+	}
+	if inv := svc.GetInventory("W2", "A"); inv.Picked != 0 || inv.Shipped != 5 {
+		t.Errorf("W2 inventory after outbound = %+v, want picked=0 shipped=5", inv)
+	}
+	detail, err := svc.GetFulfillmentDetail("OM5")
+	if err != nil {
+		t.Fatalf("detail: %v", err)
+	}
+	if len(detail.Shipments) != 2 {
+		t.Errorf("shipments = %d, want 2 (one per source allocation)", len(detail.Shipments))
+	}
+	if detail.Status != StatusShipped {
+		t.Errorf("order status = %s, want shipped", detail.Status)
+	}
+
+	// 重复出库回执：拒绝，不重复扣减库存。
+	if _, err := svc.PackageOutbound(PackageOutboundRequest{PackageID: res.NewPackage.ID}); !errors.Is(err, ErrStalePackage) {
+		t.Fatalf("duplicate outbound: want ErrStalePackage, got %v", err)
+	}
+	if inv := svc.GetInventory("W1", "A"); inv.Shipped != 5 {
+		t.Errorf("W1 shipped = %d after duplicate receipt, want 5", inv.Shipped)
+	}
+
+	// 承运揽收：shipped → in_transit；承运中的包裹不可再合并。
+	if _, err := svc.PackageTransit(PackageTransitRequest{PackageID: res.NewPackage.ID}); err != nil {
+		t.Fatalf("transit: %v", err)
+	}
+	if svc.packages[res.NewPackage.ID].Status != PackageInTransit {
+		t.Errorf("new package status = %s, want in_transit", svc.packages[res.NewPackage.ID].Status)
+	}
+	// 已合并的旧包裹也不能被揽收回执改变状态。
+	if _, err := svc.PackageTransit(PackageTransitRequest{PackageID: pkg1.ID}); !errors.Is(err, ErrStalePackage) {
+		t.Fatalf("transit merged pkg1: want ErrStalePackage, got %v", err)
+	}
+	if svc.packages[pkg1.ID].Status != PackageMerged {
+		t.Errorf("pkg1 status = %s after stale transit receipt, want merged", svc.packages[pkg1.ID].Status)
+	}
+	assertInventoryInvariant(t, svc)
+	assertPackageConsistency(t, svc)
+}
+
+func TestPackItems_ExceedsPickedAndBlocksDirectShip(t *testing.T) {
+	svc := newTestService(t)
+	mustRegister(t, svc, "W1", "A", 10)
+	conf := mustConfirm(t, svc, "OM6", []OrderLine{{SKU: "A", Quantity: 10}})
+	alloc := conf.Allocations[0]
+	if _, err := svc.ReceiptPick(alloc.ID, 10); err != nil {
+		t.Fatalf("pick: %v", err)
+	}
+
+	// 装箱数量超过已拣未装箱数量：拒绝。
+	if _, err := svc.PackItems(PackItemsRequest{
+		OrderID: "OM6", Destination: "DEST-1", Carrier: "CARRIER-A",
+		Items: []PackItem{{AllocationID: alloc.ID, Quantity: 11}},
+	}); !errors.Is(err, ErrPackExceedsPicked) {
+		t.Fatalf("over-pack: want ErrPackExceedsPicked, got %v", err)
+	}
+
+	pkg := mustPack(t, svc, "OM6", []PackItem{{AllocationID: alloc.ID, Quantity: 6}})
+	_ = pkg
+	// 已装箱的 6 件不能再通过 Ship 直接发货，只能发未装箱的 4 件。
+	if _, err := svc.Ship(ShipmentRequest{AllocationID: alloc.ID, Quantity: 5}); !errors.Is(err, ErrShipExceedsPicked) {
+		t.Fatalf("ship packed qty: want ErrShipExceedsPicked, got %v", err)
+	}
+	if _, err := svc.Ship(ShipmentRequest{AllocationID: alloc.ID, Quantity: 4}); err != nil {
+		t.Fatalf("ship unpacked qty: %v", err)
+	}
+	assertInventoryInvariant(t, svc)
+	assertPackageConsistency(t, svc)
+}
+
+// 拣货、合并、取消并发：库存扣减与包裹状态必须保持一致。
+func TestMergePackages_ConcurrentWithPickingAndCancel(t *testing.T) {
+	svc := newTestService(t)
+	mustRegister(t, svc, "W1", "A", 40)
+	conf := mustConfirm(t, svc, "OM7", []OrderLine{{SKU: "A", Quantity: 40}})
+	alloc := conf.Allocations[0]
+	// 先拣出 20 件并装成两个包裹，剩余 20 件仍在预留中。
+	if _, err := svc.ReceiptPick(alloc.ID, 20); err != nil {
+		t.Fatalf("pick: %v", err)
+	}
+	pkg1 := mustPack(t, svc, "OM7", []PackItem{{AllocationID: alloc.ID, Quantity: 10}})
+	pkg2 := mustPack(t, svc, "OM7", []PackItem{{AllocationID: alloc.ID, Quantity: 10}})
+
+	var wg sync.WaitGroup
+	// 取消：释放尚未拣货的 20 件预留。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = svc.Cancel(CancelRequest{OrderID: "OM7"})
+	}()
+	// 合并：两个待出库包裹。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = svc.MergePackages(MergePackagesRequest{
+			MergeID: "M7", OrderID: "OM7",
+			PackageIDs:  []string{pkg1.ID, pkg2.ID},
+			Destination: "DEST-1", Carrier: "CARRIER-A",
+			Items: []OrderLine{{SKU: "A", Quantity: 20}},
+		})
+	}()
+	// 迟到拣货回执：取消后分配已关闭，必须被拒绝。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = svc.ReceiptPick(alloc.ID, 20)
+	}()
+	// 旧包裹出库回执：与合并竞争，无论谁先谁后状态都必须一致。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = svc.PackageOutbound(PackageOutboundRequest{PackageID: pkg1.ID})
+	}()
+	wg.Wait()
+
+	assertInventoryInvariant(t, svc)
+	assertPackageConsistency(t, svc)
+
+	// 取消已生效：预留全部释放。
+	if inv := svc.GetInventory("W1", "A"); inv.Reserved != 0 {
+		t.Errorf("reserved = %d after cancel, want 0", inv.Reserved)
+	}
+	// 合并与旧包裹出库是互斥的：要么合并成功（两包裹 merged、新包裹 pending），
+	// 要么旧包裹先出库（pkg1 shipped、合并因 pkg1 不可合并而失败）。
+	merged := svc.merges["M7"] != nil
+	if merged {
+		if svc.packages[pkg1.ID].Status != PackageMerged || svc.packages[pkg2.ID].Status != PackageMerged {
+			t.Errorf("merge succeeded but sources are %s/%s", svc.packages[pkg1.ID].Status, svc.packages[pkg2.ID].Status)
+		}
+		newPkg := svc.packages[svc.merges["M7"].NewPackageID]
+		if newPkg.Status != PackagePending {
+			t.Errorf("new package status = %s, want pending", newPkg.Status)
+		}
+	} else {
+		if svc.packages[pkg1.ID].Status != PackageShipped {
+			t.Errorf("merge rejected but pkg1 status = %s, want shipped", svc.packages[pkg1.ID].Status)
+		}
+		if svc.packages[pkg2.ID].Status != PackagePending {
+			t.Errorf("merge rejected but pkg2 status = %s, want pending", svc.packages[pkg2.ID].Status)
+		}
+	}
+	// 无论哪种交错：库存中的已拣+已发总量恒等于分配账上的已拣量
+	// （迟到回执若先于取消到达则合法拣出 40，否则只有先前拣出的 20）。
+	inv := svc.GetInventory("W1", "A")
+	if got, want := inv.Picked+inv.Shipped, svc.allocations[alloc.ID].PickedQty; got != want {
+		t.Errorf("picked+shipped = %d, want allocation picked qty %d", got, want)
+	}
+	// 分配要么被取消（取消先生效），要么已被迟到回执拣齐关闭（回执先生效）。
+	if st := svc.allocations[alloc.ID].Status; st != AllocCancelled && st != AllocPickedComplete {
+		t.Errorf("allocation status = %s, want cancelled or picked_complete", st)
+	}
+}
+
+func TestGetFulfillmentDetail_PackageHistory(t *testing.T) {
+	svc := newTestService(t)
+	alloc1, alloc2 := setupMergeableOrder(t, svc, "OM8")
+	pkg1 := mustPack(t, svc, "OM8", []PackItem{{AllocationID: alloc1.ID, Quantity: 5}})
+	pkg2 := mustPack(t, svc, "OM8", []PackItem{{AllocationID: alloc2.ID, Quantity: 5}})
+	res, err := svc.MergePackages(MergePackagesRequest{
+		MergeID: "M8", OrderID: "OM8",
+		PackageIDs:  []string{pkg1.ID, pkg2.ID},
+		Destination: "DEST-1", Carrier: "CARRIER-A",
+		Items: []OrderLine{{SKU: "A", Quantity: 10}},
+	})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if _, err := svc.PackageOutbound(PackageOutboundRequest{PackageID: res.NewPackage.ID}); err != nil {
+		t.Fatalf("outbound: %v", err)
+	}
+
+	detail, err := svc.GetFulfillmentDetail("OM8")
+	if err != nil {
+		t.Fatalf("detail: %v", err)
+	}
+	// 原包裹 + 新包裹全部展示，按 ID 升序（创建顺序），排序稳定。
+	if len(detail.Packages) != 3 {
+		t.Fatalf("packages = %d, want 3", len(detail.Packages))
+	}
+	wantIDs := []string{pkg1.ID, pkg2.ID, res.NewPackage.ID}
+	wantStatus := []PackageStatus{PackageMerged, PackageMerged, PackageShipped}
+	for i, p := range detail.Packages {
+		if p.ID != wantIDs[i] {
+			t.Errorf("packages[%d].ID = %s, want %s", i, p.ID, wantIDs[i])
+		}
+		if p.Status != wantStatus[i] {
+			t.Errorf("packages[%d].Status = %s, want %s", i, p.Status, wantStatus[i])
+		}
+	}
+	// 商品数量：新包裹合计 10 件。
+	if got := detail.Packages[2].Items; len(got) != 1 || got[0].Quantity != 10 {
+		t.Errorf("new package items = %+v, want A:10", got)
+	}
+	// 合并审计：原包裹集合、新包裹、承运约束齐全。
+	if len(detail.Merges) != 1 {
+		t.Fatalf("merges = %d, want 1", len(detail.Merges))
+	}
+	audit := detail.Merges[0]
+	if audit.MergeID != "M8" || audit.NewPackageID != res.NewPackage.ID || audit.Carrier != "CARRIER-A" {
+		t.Errorf("unexpected merge audit %+v", audit)
+	}
+	if len(audit.SourcePackageIDs) != 2 || audit.SourcePackageIDs[0] != pkg1.ID || audit.SourcePackageIDs[1] != pkg2.ID {
+		t.Errorf("audit sources = %v, want [%s %s]", audit.SourcePackageIDs, pkg1.ID, pkg2.ID)
+	}
+	// 再次查询：结果完全一致（排序稳定、深拷贝互不影响）。
+	again, err := svc.GetFulfillmentDetail("OM8")
+	if err != nil {
+		t.Fatalf("detail again: %v", err)
+	}
+	if fmt.Sprintf("%+v", detail.Packages) != fmt.Sprintf("%+v", again.Packages) ||
+		fmt.Sprintf("%+v", detail.Merges) != fmt.Sprintf("%+v", again.Merges) {
+		t.Errorf("repeated query returned different package history")
+	}
+	assertInventoryInvariant(t, svc)
+	assertPackageConsistency(t, svc)
 }

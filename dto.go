@@ -123,8 +123,12 @@ type FulfillmentDetail struct {
 	Versions      []*PlanVersion
 	Shipments     []ShipmentRecord
 	LineSummary   []LineFulfillment
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// Packages 该订单全部包裹（含已合并的历史包裹），按包裹 ID 升序，排序稳定。
+	Packages []PackageView
+	// Merges 该订单全部合并审计记录，按合并发生顺序排列，排序稳定。
+	Merges    []MergeAudit
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // InventorySnapshot 库存台账快照（返回副本，外部修改不影响内部状态）。
@@ -137,4 +141,94 @@ type InventorySnapshot struct {
 	Picked      int
 	Shipped     int
 	Lost        int
+}
+
+// ---------- 装箱（生成包裹） ----------
+
+// PackItem 从某条分配的“已拣未发未装箱”数量中取出若干件装入包裹。
+type PackItem struct {
+	AllocationID string
+	Quantity     int
+}
+
+// PackItemsRequest 把一张订单下若干分配的已拣商品装成一个待出库包裹。
+// 同一包裹内所有商品共享目的地与承运约束。
+type PackItemsRequest struct {
+	OrderID     string
+	Destination string
+	Carrier     string
+	Items       []PackItem
+}
+
+// PackageView 包裹的对外快照。
+type PackageView struct {
+	ID          string
+	OrderID     string
+	Destination string
+	Carrier     string
+	Items       []OrderLine
+	Status      PackageStatus
+	// MergedInto 仅当 Status 为 merged 时有效：指向合并产生的新包裹 ID。
+	MergedInto string
+	// MergeID 产生（新包裹）或消费（旧包裹）本包裹的合并号。
+	MergeID   string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// ---------- 包裹合并 ----------
+
+// MergePackagesRequest 包裹合并申请。合并号为幂等键：
+// 同一合并号 + 相同内容重放返回原结果；包裹集合、目的地或商品明细变化返回
+// ErrMergeConflict；承运约束变化返回 ErrMergeCarrierConflict。
+type MergePackagesRequest struct {
+	// MergeID 合并号（幂等键）。
+	MergeID string
+	// OrderID 被合并包裹所属订单；集合中任何包裹不属于该订单即整单拒绝。
+	OrderID string
+	// PackageIDs 待合并的原包裹集合（至少 2 个，全部必须尚未出库）。
+	PackageIDs []string
+	// Destination 目的地；集合中任何包裹目的地不同即整单拒绝。
+	Destination string
+	// Carrier 承运约束；集合中任何包裹承运约束不同即整单拒绝。
+	Carrier string
+	// Items 申请声明的商品明细，必须与各原包裹商品合计完全一致。
+	Items []OrderLine
+}
+
+// MergePackagesResult 合并确认结果。Replayed 为 true 表示命中幂等、返回原结果。
+type MergePackagesResult struct {
+	MergeID string
+	OrderID string
+	// NewPackage 合并产生的唯一新包裹。
+	NewPackage PackageView
+	// MergedPackages 被合并的原包裹快照（状态已为 merged），按包裹 ID 升序。
+	MergedPackages []PackageView
+	Replayed       bool
+}
+
+// MergeAudit 合并审计记录（查询用）。
+type MergeAudit struct {
+	MergeID          string
+	OrderID          string
+	SourcePackageIDs []string
+	NewPackageID     string
+	Destination      string
+	Carrier          string
+	Items            []OrderLine
+	CreatedAt        time.Time
+}
+
+// ---------- 包裹出库 / 承运 ----------
+
+// PackageOutboundRequest 包裹出库回执：pending → shipped，
+// 库存按包裹明细从 Picked 结转至 Shipped。已合并/已出库/承运中的包裹
+// 收到回执一律返回 ErrStalePackage，不能恢复或改变其状态。
+type PackageOutboundRequest struct {
+	PackageID string
+}
+
+// PackageTransitRequest 承运揽收回执：shipped → in_transit。
+type PackageTransitRequest struct {
+	PackageID string
 }

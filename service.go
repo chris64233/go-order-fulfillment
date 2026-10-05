@@ -29,10 +29,18 @@ type FulfillmentService struct {
 	allocations map[string]*Allocation
 	// shipments 按订单保存发货记录。
 	shipments map[string][]ShipmentRecord
+	// packages 以包裹 ID 为键；已合并的包裹永久保留，不删除。
+	packages map[string]*Package
+	// merges 以合并号为键的合并审计记录（幂等键）。
+	merges map[string]*MergeRecord
 
 	now func() time.Time
 	// shipmentSeq 用于生成发货记录 ID（时间戳不可用时也保证唯一）。
 	shipmentSeq int
+	// packageSeq 用于生成包裹 ID，同时保证包裹查询排序稳定。
+	packageSeq int
+	// mergeSeq 合并记录创建序号，保证合并审计查询排序稳定。
+	mergeSeq int
 }
 
 // NewFulfillmentService 创建一个空的履约服务。
@@ -42,6 +50,8 @@ func NewFulfillmentService() *FulfillmentService {
 		orders:      make(map[string]*Order),
 		allocations: make(map[string]*Allocation),
 		shipments:   make(map[string][]ShipmentRecord),
+		packages:    make(map[string]*Package),
+		merges:      make(map[string]*MergeRecord),
 		now:         time.Now,
 	}
 }
@@ -338,9 +348,11 @@ func (s *FulfillmentService) Ship(req ShipmentRequest) (*ShipmentRecord, error) 
 	if order.Status == StatusShipped {
 		return nil, ErrAlreadyShipped
 	}
-	if req.Quantity > alloc.PickedQty-alloc.ShippedQty {
-		return nil, fmt.Errorf("%w: allocation %s picked=%d shipped=%d requested=%d",
-			ErrShipExceedsPicked, alloc.ID, alloc.PickedQty, alloc.ShippedQty, req.Quantity)
+	// 已装入待出库包裹的数量（PackedQty）只能随包裹出库扣减，不能再直接发货，
+	// 否则同一件商品会被包裹和直接发货重复发出。
+	if req.Quantity > alloc.PickedQty-alloc.ShippedQty-alloc.PackedQty {
+		return nil, fmt.Errorf("%w: allocation %s picked=%d shipped=%d packed=%d requested=%d",
+			ErrShipExceedsPicked, alloc.ID, alloc.PickedQty, alloc.ShippedQty, alloc.PackedQty, req.Quantity)
 	}
 
 	now := s.now()
@@ -556,6 +568,28 @@ func (s *FulfillmentService) detailLocked(order *Order) *FulfillmentDetail {
 
 	shipments := append([]ShipmentRecord(nil), s.shipments[order.ID]...)
 
+	packages := make([]PackageView, 0)
+	for _, p := range s.packages {
+		if p.OrderID == order.ID {
+			packages = append(packages, packageViewOf(p))
+		}
+	}
+	// 包裹 ID 含零填充序号，按 ID 升序即按创建顺序，排序稳定。
+	sort.Slice(packages, func(i, j int) bool { return packages[i].ID < packages[j].ID })
+
+	mergeRecs := make([]*MergeRecord, 0)
+	for _, m := range s.merges {
+		if m.OrderID == order.ID {
+			mergeRecs = append(mergeRecs, m)
+		}
+	}
+	// 按创建序号排序，与合并发生顺序一致，排序稳定。
+	sort.Slice(mergeRecs, func(i, j int) bool { return mergeRecs[i].seq < mergeRecs[j].seq })
+	merges := make([]MergeAudit, 0, len(mergeRecs))
+	for _, m := range mergeRecs {
+		merges = append(merges, mergeAuditOf(m))
+	}
+
 	return &FulfillmentDetail{
 		OrderID:       order.ID,
 		Status:        order.Status,
@@ -564,6 +598,8 @@ func (s *FulfillmentService) detailLocked(order *Order) *FulfillmentDetail {
 		Versions:      cloneVersions(orderVersions(order)),
 		Shipments:     shipments,
 		LineSummary:   lines,
+		Packages:      packages,
+		Merges:        merges,
 		CreatedAt:     order.CreatedAt,
 		UpdatedAt:     order.UpdatedAt,
 	}
